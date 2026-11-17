@@ -1,71 +1,170 @@
-"""回归测试：Windows 上从资源管理器拖入的路径必须规范化后才能交给 send2trash。"""
+"""Exercise real Qt drag events without starting the desktop pet."""
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ["APPDATA"] = tempfile.mkdtemp(prefix="yecatz-test-")
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QUrl
+from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
+from PySide6.QtWidgets import QApplication, QWidget
 
-from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl  # noqa: E402
-from PySide6.QtGui import QDropEvent  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
-
-import yecatz  # noqa: E402
-
-app = QApplication.instance() or QApplication([])
+import yecatz
 
 
-def make_mime(path):
-    mime = QMimeData()
-    mime.setUrls([QUrl.fromLocalFile(path)])
-    return mime
+class DragTestPet(yecatz.Pet):
+    def __init__(self):
+        QWidget.__init__(self)
+        self.transfer = SimpleNamespace(state="idle", send_file=Mock())
+        self.reading_mode = False
+        self.tick = 0
+        self.phase = ""
+        self.phase_until = 0
+        self.bubble = ""
 
-
-def make_event(mime):
-    return QDropEvent(QPointF(60, 60), Qt.DropAction.CopyAction, mime,
-                      Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    def say(self, text):
+        self.bubble = text
 
 
 class DropTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = QApplication.instance() or QApplication([])
+
     def setUp(self):
-        with patch.object(yecatz, "get_json", side_effect=OSError("offline")):
-            self.pet = yecatz.Pet()
-        self.pet.entering = False
-        self.pet.anim.stop()
+        self.pet = DragTestPet()
+        self.source = self.file_url("报告 final.pdf")
+        self.mime = QMimeData()
+        self.mime.setUrls([self.source])
+        patcher = patch.object(yecatz, "QFile")
+        self.qfile = patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def tearDown(self):
-        self.pet.transfer.disconnect()
-        self.pet.tray.hide()
-        self.pet.close()
-        app.processEvents()
+    @staticmethod
+    def file_url(name):
+        return QUrl.fromLocalFile(str(Path(tempfile.gettempdir()) / name))
 
-    def test_drop_normalizes_windows_paths(self):
-        raw = r"D:\桌面 文件夹\报告 final.pdf"
-        mime = make_mime(raw)          # 保持引用，否则 QMimeData 会被回收
-        if os.name == "nt":
-            # 这正是 bug 的来源：Qt 给出的是正斜杠路径
-            self.assertIn("/", mime.urls()[0].toLocalFile())
+    def event(self, event_type=QDropEvent, *, actions=Qt.DropAction.CopyAction, position=(60, 60)):
+        point = QPointF(*position) if event_type is QDropEvent else QPoint(*position)
+        return event_type(point, actions, self.mime, Qt.MouseButton.LeftButton,
+                          Qt.KeyboardModifier.ShiftModifier)
 
-        with patch.object(yecatz, "send2trash") as trash:
-            self.pet.dropEvent(make_event(mime))
+    @staticmethod
+    def recycled_file():
+        file = Mock()
+        file.moveToTrash.return_value = True
+        file.fileName.return_value = str(Path(tempfile.gettempdir()) / "trash" / "recycled-file")
+        return file
 
-        trash.assert_called_once()
-        passed = trash.call_args[0][0]
-        self.assertEqual(passed, os.path.normpath(raw))
-        self.assertNotIn("/", passed)
+    @staticmethod
+    def denied_file():
+        file = Mock()
+        file.moveToTrash.return_value = False
+        file.errorString.return_value = "拒绝访问"
+        return file
+
+    def test_drop_passes_qt_path_and_accepts_copy(self):
+        file = self.recycled_file()
+        self.qfile.return_value = file
+        event = self.event(actions=Qt.DropAction.CopyAction | Qt.DropAction.MoveAction)
+        self.assertEqual(event.proposedAction(), Qt.DropAction.MoveAction)
+
+        self.pet.dropEvent(event)
+
+        self.qfile.assert_called_once_with(self.source.toLocalFile())
+        file.moveToTrash.assert_called_once_with()
+        self.assertTrue(event.isAccepted())
+        self.assertEqual(event.dropAction(), Qt.DropAction.CopyAction)
+        self.assertEqual(self.pet.phase, "trash")
         self.assertIn("已移入回收站 1 个", self.pet.bubble)
 
-    def test_drop_reports_failure_reason(self):
-        mime = make_mime(r"D:\桌面 文件夹\报告 final.pdf")
-        with patch.object(yecatz, "send2trash", side_effect=OSError("拒绝访问")):
-            self.pet.dropEvent(make_event(mime))
+    def test_move_only_drag_is_rejected_at_every_stage(self):
+        for event_type, handler in ((QDragEnterEvent, self.pet.dragEnterEvent),
+                                    (QDragMoveEvent, self.pet.dragMoveEvent),
+                                    (QDropEvent, self.pet.dropEvent)):
+            with self.subTest(event=event_type.__name__):
+                event = self.event(event_type, actions=Qt.DropAction.MoveAction)
+                handler(event)
+                self.assertFalse(event.isAccepted())
+        self.qfile.assert_not_called()
 
-        self.assertIn("没能移入回收站", self.pet.bubble)
+    def test_partial_failure_reports_successes_and_failure_details(self):
+        self.mime.setUrls([self.source, self.file_url("locked.txt"), self.file_url("third.txt")])
+        self.qfile.side_effect = [self.recycled_file(), self.denied_file(), self.recycled_file()]
+        event = self.event()
+
+        self.pet.dropEvent(event)
+
+        self.assertEqual(self.qfile.call_count, 3)
+        self.assertTrue(event.isAccepted())
+        self.assertEqual(event.dropAction(), Qt.DropAction.CopyAction)
+        self.assertEqual(self.pet.phase, "trash")
+        self.assertIn("已移入回收站 2 个", self.pet.bubble)
+        self.assertIn("失败 1 个", self.pet.bubble)
+        self.assertIn("locked.txt", self.pet.bubble)
+        self.assertIn("拒绝访问", self.pet.bubble)
+
+    def test_all_failures_leave_drop_ignored_and_report_reason(self):
+        self.qfile.return_value = self.denied_file()
+        event = self.event()
+
+        self.pet.dropEvent(event)
+
+        self.assertFalse(event.isAccepted())
+        self.assertEqual(self.pet.phase, "")
         self.assertIn("报告 final.pdf", self.pet.bubble)
+        self.assertIn("拒绝访问", self.pet.bubble)
+
+    def test_missing_trash_destination_is_not_success(self):
+        file = self.recycled_file()
+        file.fileName.return_value = ""
+        self.qfile.return_value = file
+        event = self.event()
+
+        self.pet.dropEvent(event)
+
+        self.assertFalse(event.isAccepted())
+        self.assertEqual(self.pet.phase, "")
+        self.assertIn("报告 final.pdf", self.pet.bubble)
+
+    def test_malformed_and_mixed_file_urls_are_rejected(self):
+        nul_url = QUrl.fromEncoded(bytes(self.source.toEncoded()) + b"%00")
+        for urls in ([QUrl("file:")], [QUrl("file:relative.txt")], [nul_url],
+                     [self.source, QUrl("https://example.invalid/report.txt")]):
+            with self.subTest(urls=urls):
+                self.mime.setUrls(urls)
+                event = self.event()
+                self.pet.dropEvent(event)
+                self.assertFalse(event.isAccepted())
+        self.qfile.assert_not_called()
+
+    def test_reading_drop_routes_to_summary(self):
+        self.pet.reading_mode = True
+        event = self.event()
+        with patch.object(self.pet, "summarize_file") as summarize:
+            self.pet.dropEvent(event)
+
+        self.assertTrue(event.isAccepted())
+        summarize.assert_called_once_with(self.source.toLocalFile())
+        self.qfile.assert_not_called()
+
+    def test_connected_transfer_only_accepts_drop_in_box(self):
+        self.pet.transfer.state = "connected"
+        enter = self.event(QDragEnterEvent)
+        outside_box = self.event()
+        inside_box = self.event(position=(105, 185))
+
+        self.pet.dragEnterEvent(enter)
+        self.pet.dropEvent(outside_box)
+        self.pet.dropEvent(inside_box)
+
+        self.assertTrue(enter.isAccepted())
+        self.assertFalse(outside_box.isAccepted())
+        self.assertTrue(inside_box.isAccepted())
+        self.pet.transfer.send_file.assert_called_once_with(self.source.toLocalFile())
+        self.qfile.assert_not_called()
 
 
 if __name__ == "__main__":

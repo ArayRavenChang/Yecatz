@@ -134,18 +134,17 @@ enum MacUpdateInstaller {
     stage=$2
     old_pid=$3
     token=$4
-    lock=$5
-    backup="$stage/previous.app"
+    swap="$stage/yecatz-update-swap"
     replacement="$stage/unpacked/Yecatz.app"
     new_pid=
     old_exited=0
-    moved=0
-    installed=0
+    old_identity=
+    replacement_identity=
     success=0
-    printf '%s\n' "$$" > "$lock/pid" || exit 1
 
     finish() {
-        if [ "$success" -eq 0 ] && [ "$moved" -eq 1 ]; then
+        if [ "$success" -eq 0 ] && [ -n "$old_identity" ] &&
+            [ "$(/usr/bin/stat -f '%d:%i' "$replacement" 2>/dev/null)" = "$old_identity" ]; then
             if [ -n "$new_pid" ]; then
                 kill "$new_pid" 2>/dev/null || true
                 attempts=0
@@ -157,20 +156,18 @@ enum MacUpdateInstaller {
                     kill -9 "$new_pid" 2>/dev/null || true
                 fi
             fi
-            if [ "$installed" -eq 1 ] && [ -d "$target" ]; then
-                /bin/mv "$target" "$stage/failed.app" || return
-            fi
-            if [ ! -e "$target" ]; then
-                /bin/mv "$backup" "$target" || return
+            if [ "$(/usr/bin/stat -f '%d:%i' "$target" 2>/dev/null)" = "$replacement_identity" ] &&
+                "$swap" "$target" "$replacement" >> "$stage/launch.log" 2>&1; then
+                /bin/mv "$replacement" "$stage/failed.app" || true
                 printf '%s\n' '新版未能完成启动，已恢复旧版本。更新文件保留在此目录供排查。' > "$stage/failure.txt"
-                /usr/bin/open -n "$target" --args --yecatz-update-error "$stage"
+                /usr/bin/open -n "$target" --args --yecatz-update-error "$stage" </dev/null
+            else
+                printf '%s\n' '无法自动恢复旧版本。旧应用保存在此目录的 unpacked/Yecatz.app。' > "$stage/failure.txt"
             fi
         elif [ "$success" -eq 0 ] && [ "$old_exited" -eq 1 ] && [ -d "$target" ]; then
             printf '%s\n' '无法替换当前应用，已重新打开旧版本。请检查应用目录权限后重试。' > "$stage/failure.txt"
-            /usr/bin/open -n "$target" --args --yecatz-update-error "$stage"
+            /usr/bin/open -n "$target" --args --yecatz-update-error "$stage" </dev/null
         fi
-        /bin/rm -f "$lock/pid"
-        /bin/rmdir "$lock" 2>/dev/null || true
     }
     trap finish EXIT
     trap 'exit 1' HUP INT TERM
@@ -185,11 +182,11 @@ enum MacUpdateInstaller {
         sleep 1
     done
     old_exited=1
-    /bin/mv "$target" "$backup" || exit 1
-    moved=1
-    /bin/mv "$replacement" "$target" || exit 1
-    installed=1
-    "$target/Contents/MacOS/Yecatz" --yecatz-update-ready "$stage" --yecatz-update-token "$token" >> "$stage/launch.log" 2>&1 &
+    old_identity=$(/usr/bin/stat -f '%d:%i' "$target") || exit 1
+    replacement_identity=$(/usr/bin/stat -f '%d:%i' "$replacement") || exit 1
+    # The staged slot holds the original bundle after a successful exchange.
+    "$swap" "$target" "$replacement" >> "$stage/launch.log" 2>&1 || exit 1
+    "$target/Contents/MacOS/Yecatz" --yecatz-update-ready "$stage" --yecatz-update-token "$token" </dev/null >> "$stage/launch.log" 2>&1 &
     new_pid=$!
     attempts=0
     while kill -0 "$new_pid" 2>/dev/null && [ "$attempts" -lt 90 ]; do
@@ -197,8 +194,6 @@ enum MacUpdateInstaller {
             sleep 2
             kill -0 "$new_pid" 2>/dev/null || break
             success=1
-            # These generated transaction paths are adjacent to the original app.
-            /bin/rm -rf "$backup"
             /bin/rm -rf "$stage"
             exit 0
         fi
@@ -224,26 +219,15 @@ enum MacUpdateInstaller {
         return text
     }
 
-    private static func acquireLock(_ lock: URL) throws {
-        let manager = FileManager.default
-        if manager.fileExists(atPath: lock.path) {
-            let pidFile = lock.appendingPathComponent("pid")
-            guard lock.resolvingSymlinksInPath() == lock,
-                  let value = try? String(contentsOf: pidFile, encoding: .utf8),
-                  let pid = Int32(value.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0,
-                  kill(pid, 0) != 0, errno == ESRCH else {
-                throw Failure(message: "已有更新任务正在运行。请等待它完成后重试。")
-            }
-            try manager.removeItem(at: pidFile)
-            guard rmdir(lock.path) == 0 else { throw Failure(message: "无法清理上次的更新锁。") }
+    private static func acquireLock(_ lock: URL) throws -> FileHandle {
+        let fd = Darwin.open(lock.path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { throw Failure(message: "无法打开更新锁，请检查应用目录权限。") }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            let busy = errno == EWOULDBLOCK
+            Darwin.close(fd)
+            throw Failure(message: busy ? "已有更新任务正在运行。请等待它完成后重试。" : "无法锁定更新目录。")
         }
-        try manager.createDirectory(at: lock, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-        do {
-            try String(ProcessInfo.processInfo.processIdentifier).write(to: lock.appendingPathComponent("pid"), atomically: true, encoding: .utf8)
-        } catch {
-            _ = rmdir(lock.path)
-            throw error
-        }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
     static func install(_ update: GitHubUpdateChecker.Update) async throws {
@@ -258,15 +242,11 @@ enum MacUpdateInstaller {
         throw Failure(message: "当前发布包面向 Apple 芯片，请在 GitHub 查看适合本机的版本。")
         #else
         let stage = parent.appendingPathComponent(".Yecatz-update-\(UUID().uuidString)", isDirectory: true)
-        let lock = parent.appendingPathComponent(".\(target.lastPathComponent).update-lock", isDirectory: true)
-        try acquireLock(lock)
+        let lock = try acquireLock(parent.appendingPathComponent(".\(target.lastPathComponent).update-lockfile"))
+        defer { try? lock.close() }
         var handedOff = false
         defer {
-            if !handedOff {
-                try? manager.removeItem(at: stage)
-                try? manager.removeItem(at: lock.appendingPathComponent("pid"))
-                _ = rmdir(lock.path)
-            }
+            if !handedOff { try? manager.removeItem(at: stage) }
         }
         try manager.createDirectory(at: stage, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         var request = URLRequest(url: update.asset.browser_download_url, timeoutInterval: 120)
@@ -315,12 +295,18 @@ enum MacUpdateInstaller {
         let token = UUID().uuidString
         let transaction = Transaction(target: target.path, version: version, token: token)
         try JSONEncoder().encode(transaction).write(to: stage.appendingPathComponent("transaction.json"), options: .atomic)
+        guard let swap = Bundle.main.url(forResource: "yecatz-update-swap", withExtension: nil),
+              manager.isExecutableFile(atPath: swap.path) else {
+            throw Failure(message: "应用缺少更新工具，请从 GitHub 手动安装完整发行包。")
+        }
+        try manager.copyItem(at: swap, to: stage.appendingPathComponent("yecatz-update-swap"))
         let script = stage.appendingPathComponent("install.sh")
         try helper.write(to: script, atomically: true, encoding: .utf8)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = [script.path, target.path, stage.path, String(ProcessInfo.processInfo.processIdentifier), token, lock.path]
-        process.standardInput = FileHandle.nullDevice
+        process.arguments = [script.path, target.path, stage.path, String(ProcessInfo.processInfo.processIdentifier), token]
+        // The installer inherits the lock descriptor. Closing the app or installer releases it.
+        process.standardInput = lock
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try process.run()

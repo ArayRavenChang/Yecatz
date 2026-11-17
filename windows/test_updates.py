@@ -122,7 +122,7 @@ class ArchiveTests(unittest.TestCase):
                 self.assertFalse(self.destination.exists())
 
     def test_rejects_symlinks(self):
-        link = zipfile.ZipInfo("Yecatz/link")
+        link = zipfile.ZipInfo("Yecatz/_internal/link")
         link.create_system = 3
         link.external_attr = (stat.S_IFLNK | 0o777) << 16
         self.make_archive([(link, "../../outside")])
@@ -133,6 +133,12 @@ class ArchiveTests(unittest.TestCase):
         self.make_archive([("Yecatz/yecatz.EXE", b"MZother")])
         with self.assertRaises(ValueError):
             updates.extract_package(self.archive, self.destination, "2.0.0_W")
+
+    def test_rejects_package_entries_that_could_overwrite_user_files(self):
+        self.make_archive([("Yecatz/notes.txt", b"unexpected")])
+        with self.assertRaises(ValueError):
+            updates.extract_package(self.archive, self.destination, "2.0.0_W")
+        self.assertFalse(self.destination.exists())
 
     def test_rejects_mismatched_version(self):
         self.make_archive(version="3.0.0_W")
@@ -182,7 +188,7 @@ class DownloadTests(unittest.TestCase):
 class TransactionTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="yecatz-transaction-test-")
-        self.root = Path(self.directory.name)
+        self.root = Path(self.directory.name).resolve()
         self.target = self.root / "Yecatz"
         self.target.mkdir()
         (self.target / "Yecatz.exe").write_bytes(b"MZold")
@@ -225,8 +231,11 @@ class TransactionTests(unittest.TestCase):
                 patch.object(updates, "launch_helper", side_effect=launch):
             updates.prepare_update({"asset": {}, "tag_name": "2.0.0_W"}, self.resource)
         incoming = self.transaction / "Yecatz"
-        self.assertEqual((incoming / "notes.txt").read_text(), "user notes")
-        self.assertEqual((incoming / "user-files/example.txt").read_text(), "personal content")
+        self.assertEqual((self.target / "notes.txt").read_text(), "user notes")
+        self.assertEqual((self.target / "user-files/example.txt").read_text(), "personal content")
+        self.assertFalse((incoming / "notes.txt").exists())
+        self.assertFalse((incoming / "user-files").exists())
+        self.assertIn("-Recover", (self.transaction / updates.RECOVERY_NAME).read_text())
         self.assertEqual((self.target / "Yecatz.exe").read_bytes(), b"MZold")
         self.assertEqual((incoming / "Yecatz.exe").read_bytes(), b"MZnew")
 
@@ -237,6 +246,15 @@ class TransactionTests(unittest.TestCase):
         self.assertFalse(self.transaction.exists())
         self.assertEqual((self.target / "Yecatz.exe").read_bytes(), b"MZold")
         self.assertEqual((self.target / "notes.txt").read_text(), "user notes")
+
+    def test_initialization_never_exposes_transaction_without_complete_config(self):
+        with patch.object(updates.os, "fsync", side_effect=OSError("disk error")), \
+                patch.object(updates, "download_package") as download:
+            with self.assertRaisesRegex(OSError, "disk error"):
+                updates.prepare_update({"asset": {}, "tag_name": "2.0.0_W"}, self.resource)
+        download.assert_not_called()
+        self.assertFalse(self.transaction.exists())
+        self.assertEqual(list(self.root.glob(".yecatz-prepare-*")), [])
 
     def test_startup_ack_requires_installed_marker_and_matching_version(self):
         self.write_transaction()
@@ -253,9 +271,22 @@ class TransactionTests(unittest.TestCase):
     def test_retry_clears_completed_rollback(self):
         self.write_transaction()
         (self.transaction / "result.txt").write_text("rolled back")
+        (self.transaction / "applying").touch()
+        (self.transaction / "rolled-back").touch()
+        (self.transaction / "previous").mkdir()
         updates.clear_finished_transaction(self.transaction, self.target)
         self.assertFalse(self.transaction.exists())
         self.assertTrue((self.target / "Yecatz.exe").exists())
+
+    def test_retry_releases_active_name_before_recursive_cleanup(self):
+        self.write_interrupted_preparation()
+        with patch.object(updates, "process_running", return_value=False), \
+                patch.object(updates.shutil, "rmtree") as remove:
+            updates.clear_finished_transaction(self.transaction, self.target)
+        self.assertFalse(self.transaction.exists())
+        retired = remove.call_args.args[0]
+        self.assertEqual(retired.parent, self.transaction.parent)
+        self.assertTrue((retired / "config.json").is_file())
 
     def test_retry_retains_uncertain_old_backup(self):
         self.write_transaction()
@@ -270,8 +301,8 @@ class TransactionTests(unittest.TestCase):
         (self.target / "update-version.json").write_text(json.dumps({"version": "2.0.0_W"}))
         (self.transaction / "result.txt").write_text("cleanup failed")
         (self.transaction / "previous").mkdir()
-        (self.transaction / "installed").write_text("installed")
-        (self.transaction / "ready.json").write_text(json.dumps({"token": "fixture"}))
+        (self.transaction / "applying").touch()
+        (self.transaction / "committed").touch()
         updates.clear_finished_transaction(self.transaction, self.target)
         self.assertFalse(self.transaction.exists())
 
@@ -321,6 +352,7 @@ class TransactionTests(unittest.TestCase):
     def test_interrupted_installation_backup_is_retained(self):
         self.write_interrupted_preparation()
         (self.transaction / "previous").mkdir()
+        (self.transaction / "applying").touch()
         (self.transaction / "previous/old.exe").write_bytes(b"MZold")
         with patch.object(updates, "process_running", return_value=False):
             updates.clear_finished_transaction(self.transaction, self.target)

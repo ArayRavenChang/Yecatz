@@ -1,35 +1,78 @@
-﻿param([Parameter(Mandatory = $true)][string]$Transaction)
+﻿param(
+    [Parameter(Mandatory = $true)][string]$Transaction,
+    [switch]$Recover
+)
 $ErrorActionPreference = 'Stop'
 
-# All replacement and cleanup paths are derived from this one sibling directory.
 $transactionRoot = [IO.Path]::GetFullPath($Transaction).TrimEnd('\')
 $config = Get-Content -LiteralPath (Join-Path $transactionRoot 'config.json') -Raw | ConvertFrom-Json
 $target = [IO.Path]::GetFullPath($config.target).TrimEnd('\')
 $expected = Join-Path (Split-Path -Parent $target) ('.' + (Split-Path -Leaf $target) + '.yecatz-update')
-if ($transactionRoot -ne $expected -or $target -eq [IO.Path]::GetPathRoot($target).TrimEnd('\')) {
-    throw 'Invalid update directory.'
+if ($transactionRoot -ne $expected -or $target -eq [IO.Path]::GetPathRoot($target).TrimEnd('\') -or
+    $config.token -cnotmatch '^[a-zA-Z0-9-]+$') {
+    throw 'Invalid update directory or token.'
 }
-if ((Get-Item -LiteralPath $transactionRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) {
-    throw 'Update directory must not be a link.'
+
+function Get-PlainItem([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Update path must not be a link: $Path"
+    }
+    return $item
 }
+
+$targetItem = Get-PlainItem $target
+$transactionItem = Get-PlainItem $transactionRoot
+if (-not $targetItem.PSIsContainer -or -not $transactionItem.PSIsContainer) {
+    throw 'Invalid update or installation directory.'
+}
+
 $incoming = Join-Path $transactionRoot 'Yecatz'
 $backup = Join-Path $transactionRoot 'previous'
+$failed = Join-Path $transactionRoot 'failed'
 $ready = Join-Path $transactionRoot 'ready.json'
-$newProcess = $null
-$movedOld = $false
-$installed = $false
-$healthy = $false
+$applying = Join-Path $transactionRoot 'applying'
+$committed = Join-Path $transactionRoot 'committed'
+$rolledBack = Join-Path $transactionRoot 'rolled-back'
+$oldMetadataAbsent = Join-Path $transactionRoot 'old-metadata-absent'
+$runtime = @('Yecatz.exe', '_internal', 'update-version.json')
 
 function Move-WithRetry([string]$Source, [string]$Destination) {
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         try {
-            Move-Item -LiteralPath $Source -Destination $Destination -ErrorAction Stop
+            $item = Get-PlainItem $Source
+            if (-not $item) { throw "Missing update path: $Source" }
+            if ($item.PSIsContainer) {
+                [IO.Directory]::Move($Source, $Destination)
+            } else {
+                [IO.File]::Move($Source, $Destination)
+            }
             return
         } catch {
             if ($attempt -eq 29) { throw }
             Start-Sleep -Milliseconds 500
         }
     }
+}
+
+function Remove-WithRetry([string]$Path) {
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        try {
+            if (Get-PlainItem $Path) { Remove-Item -LiteralPath $Path -Recurse -Force }
+            return
+        } catch {
+            if ($attempt -eq 29) { throw }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
+function Write-Marker([string]$Path) {
+    $temporary = "$Path.tmp"
+    $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::Create, [IO.FileAccess]::Write,
+                                  [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+    try { $stream.Flush($true) } finally { $stream.Dispose() }
+    [IO.File]::Move($temporary, $Path)
 }
 
 function Start-Yecatz([string]$UpdateError = '') {
@@ -38,89 +81,171 @@ function Start-Yecatz([string]$UpdateError = '') {
     $startInfo.WorkingDirectory = $target
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
+    $startInfo.EnvironmentVariables['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
     if ($UpdateError) { $startInfo.EnvironmentVariables['YECATZ_UPDATE_ERROR'] = $UpdateError }
     return [System.Diagnostics.Process]::Start($startInfo)
 }
 
-function Remove-WithRetry([string]$Path) {
-    for ($attempt = 0; $attempt -lt 30; $attempt++) {
-        try {
-            if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop }
-            return
-        } catch {
-            if ($attempt -eq 29) { throw }
-            Start-Sleep -Milliseconds 500
-        }
-    }
+function Remove-CommittedTransaction {
+    # Retain the recovery script and durable markers until all backups are removed.
+    Remove-WithRetry $backup
+    $finished = "$transactionRoot.finished-$($config.token)"
+    Move-WithRetry $transactionRoot $finished
+    Remove-WithRetry $finished
 }
 
+function Restore-Runtime {
+    foreach ($directory in @($incoming, $backup, $failed)) {
+        $item = Get-PlainItem $directory
+        if ($item -and -not $item.PSIsContainer) { throw "Invalid update directory: $directory" }
+    }
+    [IO.Directory]::CreateDirectory($failed) | Out-Null
+    foreach ($name in $runtime) {
+        $current = Join-Path $target $name
+        $saved = Join-Path $backup $name
+        $staged = Join-Path $incoming $name
+        $rejected = Join-Path $failed $name
+
+        if (Get-PlainItem $saved) {
+            if (Get-PlainItem $current) { Move-WithRetry $current $rejected }
+            Move-WithRetry $saved $current
+        } elseif ($name -eq 'update-version.json' -and (Test-Path -LiteralPath $oldMetadataAbsent)) {
+            # A legacy installation had no version file. Remove only the staged version file.
+            if (-not (Get-PlainItem $staged) -and (Get-PlainItem $current)) {
+                Move-WithRetry $current $rejected
+            }
+        } elseif (-not (Get-PlainItem $current)) {
+            throw "Cannot restore missing runtime entry: $current"
+        }
+    }
+    # Keep the diagnostics and stage until the next update. This records completed rollback
+    # even if the helper is interrupted before opening the restored app.
+    Write-Marker $rolledBack
+}
+
+function Write-Result([string]$Message) {
+    [IO.File]::WriteAllText((Join-Path $transactionRoot 'result.txt'), $Message)
+}
+
+# Both entry points and Python cleanup serialize access to this transaction.
+$mutex = [Threading.Mutex]::new($false, "Global\Yecatz-Update-$($config.token)")
+$locked = $false
+$oldProcess = $null
+$newProcess = $null
 try {
-    if (-not (Test-Path -LiteralPath (Join-Path $incoming 'Yecatz.exe')) -or
-        (Test-Path -LiteralPath $backup)) { throw 'Invalid or unfinished update.' }
+    try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
+    if (-not $locked) { throw 'An update or recovery is already running.' }
+    # Another helper may have finished between reading config and acquiring the lock.
+    $currentConfig = Get-Content -LiteralPath (Join-Path $transactionRoot 'config.json') -Raw | ConvertFrom-Json
+    if ($currentConfig.token -cne $config.token) { throw 'The update transaction has changed.' }
+
+    if ($Recover) {
+        if (Test-Path -LiteralPath $committed) {
+            Remove-CommittedTransaction
+            exit 0
+        }
+        if (-not (Test-Path -LiteralPath $applying)) { throw 'Installation has not started.' }
+        $running = Get-Process -Name 'Yecatz' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq (Join-Path $target 'Yecatz.exe') }
+        if ($running) { throw 'Please close Yecatz before restoring the old version.' }
+        if (-not (Test-Path -LiteralPath $rolledBack)) {
+            Restore-Runtime
+            Write-Result '更新中断，已恢复旧版本。'
+        }
+        $null = Start-Yecatz '更新中断，已恢复旧版本。'
+        exit 0
+    }
+
+    if ((Test-Path -LiteralPath $applying) -or (Test-Path -LiteralPath $backup)) {
+        throw 'Invalid or unfinished update. Run Restore-Yecatz.cmd to recover.'
+    }
+    if (-not (Get-PlainItem $incoming).PSIsContainer) { throw 'Invalid update package.' }
+    foreach ($item in Get-ChildItem -LiteralPath $incoming -Force) {
+        if ($item.Name -notin $runtime) { throw "Unexpected entry in update package: $($item.Name)" }
+    }
+    foreach ($name in $runtime) {
+        $staged = Get-PlainItem (Join-Path $incoming $name)
+        $current = Get-PlainItem (Join-Path $target $name)
+        $directory = $name -eq '_internal'
+        if (-not $staged -or $staged.PSIsContainer -ne $directory -or
+            ($current -and $current.PSIsContainer -ne $directory) -or
+            (-not $current -and $name -ne 'update-version.json')) {
+            throw "Invalid runtime entry: $name"
+        }
+    }
     $oldProcess = Get-Process -Id $config.parent_pid -ErrorAction SilentlyContinue
     if ($oldProcess -and $oldProcess.Path -ne (Join-Path $target 'Yecatz.exe')) {
         throw 'The running application path does not match the installation.'
     }
+
     [IO.File]::WriteAllText((Join-Path $transactionRoot 'helper-ready'), 'ready')
-    if ($oldProcess -and -not $oldProcess.WaitForExit(60000)) {
-        throw 'Yecatz did not exit within 60 seconds.'
-    }
-    Move-WithRetry $target $backup
-    $movedOld = $true
-    Move-WithRetry $incoming $target
-    $installed = $true
-    [IO.File]::WriteAllText((Join-Path $transactionRoot 'installed'), 'installed')
-    # Reset PyInstaller's inherited state before starting the replacement build.
-    $env:PYINSTALLER_RESET_ENVIRONMENT = '1'
-    $newProcess = Start-Yecatz
-    for ($attempt = 0; $attempt -lt 120; $attempt++) {
-        if (Test-Path -LiteralPath $ready) {
-            $ack = Get-Content -LiteralPath $ready -Raw | ConvertFrom-Json
-            if ($ack.token -eq $config.token -and $ack.tag -eq $config.tag -and $ack.pid -eq $newProcess.Id) {
-                Start-Sleep -Seconds 2
-                $newProcess.Refresh()
-                $healthy = -not $newProcess.HasExited
-                break
-            }
+    $oldExited = $false
+    try {
+        if ($oldProcess -and -not $oldProcess.WaitForExit(60000)) {
+            throw 'Yecatz did not exit within 60 seconds.'
         }
-        $newProcess.Refresh()
-        if ($newProcess.HasExited) { break }
-        Start-Sleep -Milliseconds 500
-    }
-    if (-not $healthy) { throw 'The new version did not confirm a successful startup.' }
-    # The exact old installation is removed only after the replacement is ready.
-    Remove-WithRetry $backup
-    Remove-WithRetry $transactionRoot
-} catch {
-    $failure = $_.Exception.Message
-    if ($healthy) {
-        # A partial directory cleanup may have removed config.json before a locked file.
-        [IO.Directory]::CreateDirectory($transactionRoot) | Out-Null
-        [IO.File]::WriteAllText((Join-Path $transactionRoot 'config.json'), ($config | ConvertTo-Json -Compress))
-        [IO.File]::WriteAllText((Join-Path $transactionRoot 'result.txt'), "更新已成功，旧版清理未完成。请关闭占用文件的程序后重试。`r`n$failure")
+        $oldExited = $true
+        if (-not (Get-PlainItem (Join-Path $target 'update-version.json'))) {
+            Write-Marker $oldMetadataAbsent
+        }
+        Write-Marker $applying
+        [IO.Directory]::CreateDirectory($backup) | Out-Null
+        foreach ($name in $runtime) {
+            $current = Join-Path $target $name
+            if (Get-PlainItem $current) { Move-WithRetry $current (Join-Path $backup $name) }
+            Move-WithRetry (Join-Path $incoming $name) $current
+        }
+        Write-Marker (Join-Path $transactionRoot 'installed')
+
+        $newProcess = Start-Yecatz
+        $healthy = $false
+        for ($attempt = 0; $attempt -lt 120; $attempt++) {
+            if (Test-Path -LiteralPath $ready) {
+                $ack = Get-Content -LiteralPath $ready -Raw | ConvertFrom-Json
+                if ($ack.token -ceq $config.token -and $ack.tag -ceq $config.tag -and $ack.pid -eq $newProcess.Id) {
+                    Start-Sleep -Seconds 2
+                    $newProcess.Refresh()
+                    $healthy = -not $newProcess.HasExited
+                    break
+                }
+            }
+            $newProcess.Refresh()
+            if ($newProcess.HasExited) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $healthy) { throw 'The new version did not confirm a successful startup.' }
+        Write-Marker $committed
+    } catch {
+        $failure = $_.Exception.Message
+        $line = [Environment]::NewLine
+        try {
+            if ($newProcess) {
+                $newProcess.Refresh()
+                if (-not $newProcess.HasExited) {
+                    Stop-Process -Id $newProcess.Id -Force
+                    $newProcess.WaitForExit()
+                }
+            }
+            if (Test-Path -LiteralPath $applying) { Restore-Runtime }
+            Write-Result "更新失败，已恢复旧版本。$line$failure"
+            if ($oldExited) {
+                $null = Start-Yecatz "更新失败，已恢复旧版本。详细记录保存在 $transactionRoot。$failure"
+            }
+        } catch {
+            Write-Result "恢复未完成。请退出 Yecatz，再运行 Restore-Yecatz.cmd。$line$failure$line$($_.Exception.Message)"
+        }
         exit 1
     }
+
     try {
-        if ($newProcess) {
-            $newProcess.Refresh()
-            if (-not $newProcess.HasExited) {
-                Stop-Process -Id $newProcess.Id -Force
-                $newProcess.WaitForExit()
-            }
-        }
-        if ($installed) { Move-WithRetry $target (Join-Path $transactionRoot 'failed') }
-        if ($movedOld) {
-            Move-WithRetry $backup $target
-            Remove-Item -LiteralPath (Join-Path $transactionRoot 'installed') -ErrorAction SilentlyContinue
-            $env:PYINSTALLER_RESET_ENVIRONMENT = '1'
-            $null = Start-Yecatz "更新失败，已恢复旧版本。详细记录保存在 $transactionRoot。$failure"
-        } elseif (-not $oldProcess -or $oldProcess.HasExited) {
-            $env:PYINSTALLER_RESET_ENVIRONMENT = '1'
-            $null = Start-Yecatz "更新失败，已重新启动原版本。详细记录保存在 $transactionRoot。$failure"
-        }
-        [IO.File]::WriteAllText((Join-Path $transactionRoot 'result.txt'), "更新失败，原版本已保留或恢复。`r`n$failure")
+        Remove-CommittedTransaction
     } catch {
-        [IO.File]::WriteAllText((Join-Path $transactionRoot 'result.txt'), "自动恢复未完成，旧版保存在 previous 目录。`r`n$failure`r`n$($_.Exception.Message)")
+        if (Test-Path -LiteralPath $transactionRoot) {
+            Write-Result "更新成功，清理未完成。可运行 Restore-Yecatz.cmd 重试。$($_.Exception.Message)"
+        }
+        throw
     }
-    exit 1
+} finally {
+    if ($locked) { $mutex.ReleaseMutex() }
+    $mutex.Dispose()
 }

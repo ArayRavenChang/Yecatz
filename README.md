@@ -86,6 +86,8 @@ Yecatz 启动时会联网检查 GitHub Releases，也可以通过菜单手动检
 
 发现新版本后，确认更新即可下载对应平台的安装包、替换当前应用并重新启动。新版完成启动检查后，更新程序会自动清理本次替换产生的旧应用备份。安装或启动失败时会尝试恢复旧版，失败提示中会提供后续处理信息。请在文件传输结束后更新，并将应用放在当前账号可写入的目录。
 
+Windows 更新仅替换应用自带的运行文件。安装被关机等操作中断时，可按 Windows 说明恢复。macOS 一次交换两个应用目录，原安装路径在交换前后都保留应用。若交换后更新工具被强制退出且新版无法启动，可以在安装目录显示隐藏项，找到本次更新的 `.Yecatz-update-*` 目录，核对其中 `unpacked/Yecatz.app` 的版本后，用备份恢复旧版。 [Windows 更新恢复](windows/README.md#更新)
+
 已发布的旧版需要先手动安装一次包含此更新功能的版本，之后即可使用上述流程。
 
 ### 发布新版本
@@ -97,7 +99,7 @@ Yecatz 启动时会联网检查 GitHub Releases，也可以通过菜单手动检
 | Windows | `1.0.0_W` | `Yecatz-Windows-x64.zip` |
 | macOS | `1.0.0_M` | `Yecatz-macOS-arm64.zip` |
 
-构建前需要向维护者取得完整的 `Assets` 素材。当前源码仓库尚缺少主动画图片、`AppIcon.icns` 和 `pixel-zh-hans.ttf` 等构建及运行资源，需先补齐再打包。
+构建前需要向维护者取得完整的 `Assets` 素材。当前源码仓库尚缺少主动画图片、`AppIcon.icns` 和 `pixel-zh-hans.ttf` 等构建及运行资源。两端的构建脚本会在开始构建前列出缺少或为空的必需素材。
 
 Windows 在 PowerShell 中构建，版本参数会写入压缩包中的 `Yecatz/update-version.json`。
 
@@ -122,7 +124,7 @@ Windows 的版本筛选与安装事务测试在项目根目录运行，需要 Py
 py -3.12 -m unittest discover -s windows -p "test_update*.py" -v
 ```
 
-macOS 的版本筛选测试需要支持本项目的 Swift 工具链。安装辅助脚本测试使用 Python 3 和 Bash，在临时目录中模拟应用替换。
+macOS 的版本筛选测试需要支持本项目的 Swift 工具链。安装辅助脚本测试使用 Python 3 和 macOS Swift 工具链，在临时目录中验证原子交换、回滚和强制中断后的状态。
 
 ```bash
 xcrun swiftc -swift-version 5 -parse-as-library Updates.swift tools/test_updates.swift -o /tmp/yecatz-update-tests

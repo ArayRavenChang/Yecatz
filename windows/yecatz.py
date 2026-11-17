@@ -273,8 +273,11 @@ class Pet(QWidget):
         self.entry_tick = 0
         self.show()
         self.windowHandle().screenChanged.connect(self.schedule_display_refresh)
-        self.schedule_display_refresh()
         self.thread(self.check_update, False)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.schedule_display_refresh()
 
     def event(self, event):
         dpi_changed = event.type() == QEvent.Type.DevicePixelRatioChange

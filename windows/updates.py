@@ -1,4 +1,5 @@
 """Platform-specific releases and staged updates for the Windows distribution."""
+from contextlib import contextmanager
 import hashlib
 import ctypes
 import json
@@ -9,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.parse
 import urllib.request
@@ -20,6 +22,14 @@ REPOSITORY = "YenningC/Yecatz"
 ASSET_NAME = "Yecatz-Windows-x64.zip"
 MAX_ARCHIVE = 1024 * 1024 * 1024
 MAX_EXTRACTED = 3 * MAX_ARCHIVE
+RUNTIME_NAMES = {"yecatz.exe", "_internal", "update-version.json"}
+RECOVERY_NAME = "Restore-Yecatz.cmd"
+RECOVERY_SCRIPT = r"""@echo off
+setlocal DisableDelayedExpansion
+cd /d "%SystemRoot%" || exit /b 1
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0install-update.ps1" -Transaction "%~dp0." -Recover
+if errorlevel 1 pause
+"""
 
 
 def version(value, release=False):
@@ -103,6 +113,7 @@ def extract_package(archive, destination, tag):
             path = PurePosixPath(name)
             mode = item.external_attr >> 16
             if (not path.parts or path.parts[0] != "Yecatz" or path.is_absolute()
+                    or (len(path.parts) > 1 and path.parts[1].lower() not in RUNTIME_NAMES)
                     or any(part in (".", "..") or ":" in part or part.endswith((" ", "."))
                            or re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part)
                            for part in path.parts)
@@ -159,6 +170,13 @@ def transaction_path(target):
     return target.parent / ("." + target.name + ".yecatz-update")
 
 
+def retire_transaction(transaction):
+    # Clear the active name first so interrupted cleanup cannot block the next update.
+    retired = transaction.with_name(f"{transaction.name}.finished-{uuid.uuid4().hex}")
+    transaction.rename(retired)
+    shutil.rmtree(retired, ignore_errors=True)
+
+
 def process_running(pid):
     if type(pid) is not int or pid <= 0:
         return False
@@ -176,23 +194,74 @@ def process_running(pid):
         kernel.CloseHandle(handle)
 
 
+@contextmanager
+def transaction_lock(token):
+    if os.name != "nt":
+        yield True
+        return
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    kernel.CreateMutexW.restype = ctypes.c_void_p
+    kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    kernel.ReleaseMutex.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel.CreateMutexW(None, False, rf"Global\Yecatz-Update-{token}")
+    if not handle:
+        yield False
+        return
+    try:
+        acquired = kernel.WaitForSingleObject(handle, 0) in (0, 0x80)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                kernel.ReleaseMutex(handle)
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def clear_finished_transaction(transaction, target):
-    """Permit retry after rollback or cleanup failure, retaining uncertain backups."""
-    if transaction.is_symlink():
+    """Reclaim abandoned staging or a completed transaction, keeping interrupted swaps."""
+    if transaction.is_symlink() or transaction.is_junction():
         return
-    if not (transaction / "config.json").is_file():
+    config_path = transaction / "config.json"
+    try:
+        initial = json.loads(config_path.read_text(encoding="utf-8"))
+        token = initial["token"]
+    except (OSError, ValueError, KeyError, TypeError):
         return
-    config = json.loads((transaction / "config.json").read_text(encoding="utf-8"))
-    if Path(config["target"]).resolve() != target:
+    if not isinstance(token, str) or not re.fullmatch(r"[a-zA-Z0-9-]+", token):
+        return
+    with transaction_lock(token) as acquired:
+        if not acquired:
+            return
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            matches = config["token"] == token and Path(config["target"]).resolve() == target.resolve()
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        if matches:
+            reclaim_transaction(transaction, config)
+
+
+def reclaim_transaction(transaction, config):
+    if process_running(config.get("parent_pid")) or process_running(config.get("helper_pid")):
+        return
+    if (transaction / "rolled-back").is_file():
+        retire_transaction(transaction)
+        return
+    if (transaction / "applying").exists():
+        if ((transaction / "committed").is_file()
+                and version(installed_version()) == version(config["tag"], True)):
+            retire_transaction(transaction)
         return
     if not (transaction / "result.txt").is_file():
         # A process interrupted during download leaves no result. Reclaim only its
         # staged files, after both the original app and any installer have exited.
-        if (config.get("phase") != "preparing" or process_running(config.get("parent_pid"))
-                or process_running(config.get("helper_pid"))
+        if (config.get("phase") != "preparing"
                 or (transaction / "previous").exists() or (transaction / "installed").exists()):
             return
-        shutil.rmtree(transaction)
+        retire_transaction(transaction)
         return
     if (transaction / "previous").exists():
         if not (transaction / "installed").is_file() or version(installed_version()) != version(config["tag"], True):
@@ -200,7 +269,7 @@ def clear_finished_transaction(transaction, target):
         acknowledgment = json.loads((transaction / "ready.json").read_text(encoding="utf-8"))
         if acknowledgment.get("token") != config["token"]:
             return
-    shutil.rmtree(transaction)
+    retire_transaction(transaction)
 
 
 def launch_helper(transaction):
@@ -248,30 +317,31 @@ def prepare_update(release, resource_root):
     transaction = transaction_path(target)
     if transaction.exists():
         clear_finished_transaction(transaction, target)
+    config = {"target": str(target), "parent_pid": os.getpid(), "tag": release["tag_name"],
+              "token": uuid.uuid4().hex, "phase": "preparing"}
+    pending = Path(tempfile.mkdtemp(prefix=".yecatz-prepare-", dir=target.parent))
     try:
-        transaction.mkdir()
-    except FileExistsError:
-        raise ValueError(f"上次更新尚未完成，更新记录和可能的旧版备份位于 {transaction}。") from None
+        with (pending / "config.json").open("w", encoding="utf-8") as output:
+            json.dump(config, output)
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            pending.rename(transaction)
+        except OSError:
+            if transaction.exists() or transaction.is_symlink():
+                raise ValueError(f"上次更新尚未完成。请退出 Yecatz，再运行 {transaction / RECOVERY_NAME} 恢复。") from None
+            raise
+    finally:
+        shutil.rmtree(pending, ignore_errors=True)
     helper = None
     try:
-        config = {"target": str(target), "parent_pid": os.getpid(), "tag": release["tag_name"],
-                  "token": uuid.uuid4().hex, "phase": "preparing"}
         config_file = transaction / "config.json"
-        config_file.write_text(json.dumps(config), encoding="utf-8")
         archive = transaction / "package.zip"
         download_package(release["asset"], archive)
-        incoming = extract_package(archive, transaction, release["tag_name"])
-        # Retain user-added files beside the application when replacing its directory.
-        for original in target.iterdir():
-            destination = incoming / original.name
-            if original.name.lower() in ("yecatz.exe", "_internal", "update-version.json") or destination.exists():
-                continue
-            if original.is_dir() and not original.is_symlink():
-                shutil.copytree(original, destination, symlinks=True)
-            else:
-                shutil.copy2(original, destination, follow_symlinks=False)
+        extract_package(archive, transaction, release["tag_name"])
         archive.unlink()
         shutil.copyfile(resource_root / "install-update.ps1", transaction / "install-update.ps1")
+        (transaction / RECOVERY_NAME).write_text(RECOVERY_SCRIPT, encoding="ascii", newline="\r\n")
         helper = launch_helper(transaction)
         config["helper_pid"] = helper.pid
         temporary_config = transaction / "config.tmp"
@@ -292,7 +362,11 @@ def prepare_update(release, resource_root):
         if helper is not None and helper.poll() is None:
             helper.terminate()
             helper.wait(timeout=10)
-        shutil.rmtree(transaction, ignore_errors=True)
+        if not (transaction / "applying").exists():
+            try:
+                retire_transaction(transaction)
+            except OSError:
+                pass
         raise
 
 

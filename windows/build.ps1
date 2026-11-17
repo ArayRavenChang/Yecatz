@@ -1,7 +1,21 @@
-param([string]$Version = "")
+﻿param([string]$Version = "")
 
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
+$requiredAssets = @("cat.png", "cat-blink.png", "cat-entry.png", "AppIcon.icns", "pixel-zh-hans.ttf", "tie-status.png")
+$missingAssets = @(
+    foreach ($name in $requiredAssets) {
+        $path = Join-Path "Assets" $name
+        $asset = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        if (-not $asset -or $asset.PSIsContainer -or $asset.Length -eq 0) {
+            $path
+        }
+    }
+)
+if ($missingAssets.Count -gt 0) {
+    throw ("缺少必需素材或文件为空，请向维护者取得完整的 Assets 目录：`n  " + ($missingAssets -join "`n  "))
+}
+
 if (-not (Test-Path ".venv-win\Scripts\python.exe")) {
     py -3.12 -m venv .venv-win
     if ($LASTEXITCODE -ne 0) { throw "请先安装 Windows 版 Python 3.12。" }

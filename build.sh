@@ -7,6 +7,12 @@ if [[ "${1:-}" == "chat" ]]; then
     exit 2
 fi
 
+release_tag="${1:-}"
+if [[ "$#" -gt 1 ]] || [[ -n "$release_tag" && ! "$release_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+_M$ ]]; then
+    printf '版本参数应使用 ./build.sh 1.0.0_M 格式。\n' >&2
+    exit 2
+fi
+
 sdk="${SDKROOT:-}"
 if [[ -z "$sdk" ]]; then
     probe="$(mktemp "${TMPDIR:-/tmp}/yecatz-sdk.XXXXXX.swift")"
@@ -43,6 +49,11 @@ install_bundle() {
 contents="$scratch/Yecatz.app/Contents"
 mkdir -p "$contents/MacOS" "$contents/Resources"
 cp Info.plist "$contents/Info.plist"
+if [[ -n "$release_tag" ]]; then
+    release_version="${release_tag%_M}"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $release_version" "$contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $release_version" "$contents/Info.plist"
+fi
 cp persona.md "$contents/Resources/persona.md"
 ditto Assets "$contents/Resources"
 "${compiler[@]}" -target "$(uname -m)-apple-macos14.0" main.swift Chat.swift Commands.swift Weather.swift Updates.swift Transfer.swift -o "$contents/MacOS/Yecatz"
